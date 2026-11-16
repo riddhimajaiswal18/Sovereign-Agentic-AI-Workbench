@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+
+# generated/runtime artifacts — never track
+workspace/outputs/
+workspace/sandbox/
+workspace/vector_store.json
+workspace/uploads/*.png
+workspace/uploads/inspection_report.pdf
+
+# personal files — purged from history 2026-11-01, never re-track
+workspace/kb/Untitled document (1).pdf
+workspace/uploads/Untitled document (2).pdf
+workspace/uploads/Attention_is_all_you_need.pdf

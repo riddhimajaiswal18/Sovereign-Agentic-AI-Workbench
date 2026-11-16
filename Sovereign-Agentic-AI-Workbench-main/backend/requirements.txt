@@ -1,0 +1,13 @@
+# Pinned to versions verified working together (Oct 2026).
+# air-gapped installs: vendor these wheels — there is no pip at the target site.
+fastapi==0.139.0
+uvicorn[standard]==0.51.0
+httpx==0.28.1
+numpy==2.2.6
+pypdf==6.17.0
+pypdfium2==5.13.0
+openpyxl==3.1.5
+python-docx==1.2.0
+python-pptx==1.0.2
+pytesseract==0.3.13   # requires the Tesseract OS binary (see README step 0)
+Pillow==12.3.0

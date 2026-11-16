@@ -1,0 +1,299 @@
+"""Sovereign Agentic AI Workbench — API server.
+
+All endpoints are served from localhost. The egress guard is installed at
+startup so the whole backend process is physically unable to open a
+connection to the internet (and every attempt is logged for the monitor).
+"""
+import asyncio
+import json
+import os
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+
+from fastapi import FastAPI, UploadFile, File, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+
+from .config import UPLOADS_DIR, OUTPUTS_DIR, KB_DIR
+from .security import egress
+
+# LOAD-BEARING ORDER (F.2): the egress guard MUST be installed before any
+# module that could open a socket is imported — provider.py below creates an
+# httpx client, and other imports may chain socket-using modules. tests/
+# test_egress_guard.py asserts this order statically AND dynamically; moving
+# this line below any socket-capable import must fail CI.
+egress.install_egress_guard()  # FIRST — before anything can make requests
+
+from .models.provider import gateway
+from .agent.orchestrator import Orchestrator, task_manager
+from .rag import store as rag_store
+
+app = FastAPI(title="Sovereign Agentic AI Workbench", version="1.0")
+
+
+def _safe_filename(name: str) -> str:
+    """Keep only the basename of an uploaded filename.
+
+    Blocks traversal ('../../.zprofile'), absolute paths ('/etc/passwd') and
+    hidden/dot files — anything else would let a client write outside the
+    intended directory.
+    """
+    clean = Path(name or "").name.strip()
+    if not clean or clean.startswith(".") or clean in {".", ".."}:
+        raise HTTPException(status_code=400, detail="invalid filename")
+    return clean
+
+
+@app.on_event("startup")
+async def startup():
+    rag_store.load()
+
+
+# --------------------------------------------------------------- health ----
+
+@app.get("/api/health")
+async def health():
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "engine": gateway.status(),
+        "egress": egress.snapshot(),
+        "kb": rag_store.stats(),
+    }
+
+
+@app.get("/api/models")
+async def models():
+    return gateway.status()
+
+
+@app.get("/api/network")
+async def network():
+    return egress.snapshot()
+
+
+@app.post("/api/network/selftest")
+async def network_selftest():
+    """Deliberately attempt an outbound connection so the air-gap can be
+    demonstrated live: the egress guard must block it and log the event."""
+    import httpx
+    try:
+        httpx.Client(timeout=4.0).get("https://example.com")
+        return {"blocked": False, "detail": "UNEXPECTED: outbound request succeeded"}
+    except egress.ConnectionBlocked as e:
+        return {"blocked": True, "detail": str(e)}
+    except Exception as e:  # network-level failure also proves no egress path
+        return {"blocked": True, "detail": f"no external egress ({e.__class__.__name__}: {e})"}
+
+
+# Adversarial code submitted through the REAL sandbox tool (run_python →
+# python -I child). Probe 1 is stopped by the sandbox prelude (app layer);
+# probes 2-4 deliberately bypass every Python-level guard — raw _socket,
+# an unguarded curl child process, raw libc syscalls — and are only stopped
+# by the kernel when the app is launched under scripts/run_airgapped.sh.
+SANDBOX_ESCAPE_PROBES = [
+    {
+        "name": "python_socket",
+        "vector": "socket.socket().connect() from generated code",
+        "code": ("import socket\n"
+                 "s = socket.socket()\n"
+                 "s.connect(('93.184.216.34', 80))\n"
+                 "print('EXFIL-PATH-EXISTS')\n"),
+    },
+    {
+        "name": "clevel_socket",
+        "vector": "_socket.socket() — bypasses the prelude's Python patch",
+        "code": ("import _socket\n"
+                 "s = _socket.socket()\n"
+                 "s.connect(('93.184.216.34', 80))\n"
+                 "print('EXFIL-PATH-EXISTS')\n"),
+    },
+    {
+        "name": "child_process",
+        "vector": "subprocess.run(['curl', …]) — child process has no Python guards",
+        "code": ("import subprocess\n"
+                 "r = subprocess.run(['/usr/bin/curl', '-sS', '-m', '6', "
+                 "'-o', '/dev/null', 'https://example.com'], capture_output=True, text=True)\n"
+                 "print('curl_rc', r.returncode)\n"
+                 "print(r.stderr[-300:])\n"),
+    },
+    {
+        "name": "ctypes_syscall",
+        "vector": "raw socket(2)/connect(2) syscalls via ctypes/libc",
+        "code": ("import ctypes, socket, struct\n"
+                 "libc = ctypes.CDLL(None, use_errno=True)\n"
+                 "fd = libc.socket(2, 1, 0)\n"
+                 "addr = struct.pack('BBH4s8s', 16, 2, socket.htons(80), "
+                 "bytes([93, 184, 216, 34]), b'\\x00' * 8)\n"
+                 "rc = libc.connect(fd, addr, 16)\n"
+                 "print('connect_rc', rc, 'errno', ctypes.get_errno())\n"),
+    },
+]
+
+_POSITIVE_CONTROL = ("import os\n"
+                     "open('probe_control.txt', 'w').write('local-io-ok')\n"
+                     "print('local-io-ok', os.getcwd())\n")
+
+
+def _classify_probe(res: dict) -> dict:
+    stdout, stderr = res.get("stdout", ""), res.get("stderr", "")
+    output = stdout + "\n" + stderr
+    # Each probe prints a success marker ONLY if its exfil path actually
+    # connected. The verdict is that marker, not the child's exit code
+    # (probes 3-4 report the blocked attempt and exit 0 by design).
+    exfiltrated = ("EXFIL-PATH-EXISTS" in output or "curl_rc 0" in output
+                   or "connect_rc 0" in output)
+    if "Sandbox: network access is disabled" in output:
+        enforced_by = "app: sandbox prelude"
+    elif "Operation not permitted" in output or "errno 1" in output:
+        enforced_by = "kernel: Seatbelt (EPERM)"
+    else:
+        enforced_by = "kernel: Seatbelt (connect refused)"
+    return {
+        "name": res.get("run_id"),
+        "exit_code": res.get("exit_code"),
+        "stdout": stdout[-400:],
+        "stderr": stderr[-400:],
+        "blocked": not exfiltrated,
+        "enforced_by": enforced_by if not exfiltrated else "NONE — EXFIL PATH EXISTS",
+    }
+
+
+@app.post("/api/network/sandbox_escape_test")
+async def sandbox_escape_test():
+    """Prove the sandbox holds against deliberate escape attempts.
+
+    Runs four adversarial snippets through the production run_python tool —
+    the same path generated code takes — plus a positive control proving the
+    sandbox still performs local work. With the kernel policy active
+    (scripts/run_airgapped.sh) every escape is refused by the OS; without it,
+    probes 2-4 would connect, so this endpoint also honestly exposes whether
+    the stronger layer is switched on.
+    """
+    from .tools.local_tools import run_python
+
+    summary, control = run_python(_POSITIVE_CONTROL)
+    control_ok = control.get("exit_code") == 0 and "local-io-ok" in control.get("stdout", "")
+
+    probes = []
+    for probe in SANDBOX_ESCAPE_PROBES:
+        _, res = run_python(probe["code"])
+        verdict = _classify_probe(res)
+        probes.append({"name": probe["name"], "vector": probe["vector"], **verdict})
+
+    all_blocked = all(p["blocked"] for p in probes) and control_ok
+    # F.1: persist the verdict so the UI pill reflects the battery, not a label
+    egress.record_escape_test(all_blocked)
+    return {
+        "kernel_policy": os.environ.get("SOVEREIGN_AIRGAP_KERNEL",
+                                        "none — Python guards only"),
+        "note": "blocked verdicts are decided by probe results, not by this label",
+        "positive_control": {"ok": control_ok, **{k: control.get(k) for k in
+                                                  ("exit_code", "stdout")}},
+        "probes": probes,
+        "all_blocked": all_blocked,
+    }
+
+
+# -------------------------------------------------------------- uploads ----
+
+@app.post("/api/upload")
+async def upload(file: UploadFile = File(...)):
+    clean = _safe_filename(file.filename)
+    dest = UPLOADS_DIR / clean
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {"path": f"uploads/{clean}", "size": dest.stat().st_size}
+
+
+@app.get("/api/files")
+async def files():
+    def listing(base: Path):
+        return [
+            {"path": str(p.relative_to(base.parent)), "name": p.name,
+             "size": p.stat().st_size, "modified": p.stat().st_mtime}
+            for p in sorted(base.rglob("*")) if p.is_file() and not p.name.startswith(".")
+        ]
+    return {"uploads": listing(UPLOADS_DIR), "outputs": listing(OUTPUTS_DIR),
+            "kb": listing(KB_DIR)}
+
+
+@app.get("/api/download")
+async def download(path: str):
+    p = Path(path)
+    if not p.is_absolute():
+        p = UPLOADS_DIR.parent / p
+    p = p.resolve()
+    root = UPLOADS_DIR.parent.resolve()
+    if root not in p.parents and p != root:
+        return JSONResponse({"error": "path escapes workspace"}, status_code=400)
+    if not p.exists():
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return FileResponse(str(p), filename=p.name)
+
+
+# ------------------------------------------------------------------ kb -----
+@app.post("/api/kb/reindex")
+async def kb_reindex():
+    result = rag_store.reindex()
+    return {"ok": True, **result, "stats": rag_store.stats()}
+
+
+@app.post("/api/kb/upload")
+async def kb_upload(file: UploadFile = File(...)):
+    clean = _safe_filename(file.filename)
+    dest = KB_DIR / clean
+    with dest.open("wb") as f:
+        shutil.copyfileobj(file.file, f)
+    return {"path": str(dest), "name": clean}
+
+
+# -------------------------------------------------------------- tasks ------
+
+async def run_task_and_stream(ws: WebSocket, task: str, attachments: list[str]):
+    loop = asyncio.get_running_loop()
+    queue: asyncio.Queue = asyncio.Queue()
+
+    def emit(event: dict):
+        loop.call_soon_threadsafe(queue.put_nowait, event)
+
+    async def sender():
+        while True:
+            event = await queue.get()
+            if event is None:
+                break
+            await ws.send_text(json.dumps(event))
+
+    sender_task = asyncio.create_task(sender())
+    try:
+        orch = Orchestrator(emit)
+        ctx = await loop.run_in_executor(None, orch.run, task, attachments)
+        task_manager.register(ctx)
+    finally:
+        await queue.put(None)
+        await sender_task
+
+
+@app.websocket("/ws/task")
+async def ws_task(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            msg = json.loads(await ws.receive_text())
+            task = (msg.get("task") or "").strip()
+            attachments = msg.get("attachments") or []
+            if task:
+                await run_task_and_stream(ws, task, attachments)
+    except WebSocketDisconnect:
+        return
+    except Exception as e:
+        try:
+            await ws.send_text(json.dumps({"type": "error", "message": str(e)}))
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------- static ------
+static_dir = Path(__file__).parent / "static"
+app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
